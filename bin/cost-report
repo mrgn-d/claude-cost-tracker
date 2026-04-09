@@ -1,0 +1,681 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const BASE_DIR = process.env.COST_TRACKER_DIR || path.join(os.homedir(), '.claude', 'cost-tracker');
+const ACTIVITY_FILE = path.join(BASE_DIR, 'activity.jsonl');
+const COSTS_FILE = path.join(BASE_DIR, 'costs.jsonl');
+const SESSIONS_FILE = path.join(BASE_DIR, 'tags', 'sessions.json');
+const CONFIG_FILE = path.join(BASE_DIR, 'config.json');
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+function loadJsonl(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+  } catch (_) {
+    return [];
+  }
+}
+
+function loadJson(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (_) {
+    return {};
+  }
+}
+
+/**
+ * Filter cost entries by date range using session timestamp (when the work happened),
+ * falling back to harvestedAt if no session timestamp is available.
+ */
+function getCostsInRange(costs, range) {
+  return costs.filter(e => inRange(e.sessionTimestamp || e.harvestedAt, range));
+}
+
+/**
+ * Turn a full filesystem path into something readable.
+ * /Users/foo/dev/github.com/splice/platform → splice/platform
+ */
+function getProjectFromPath(p) {
+  if (!p) return 'unknown';
+  // Strip common home prefixes
+  const home = os.homedir();
+  let rel = p.startsWith(home) ? p.slice(home.length + 1) : p;
+  // Strip leading dev/github.com style segments
+  rel = rel.replace(/^(dev\/[^/]+\/|src\/|projects\/|code\/|workspace\/)/, '');
+  // Return last 2 path components for readability
+  const parts = rel.replace(/^\//, '').split('/');
+  return parts.length >= 2 ? parts.slice(-2).join('/') : parts.join('/') || 'unknown';
+}
+
+// ── argument parsing ──────────────────────────────────────────────────────────
+
+function parseArgs(argv) {
+  const args = { format: 'summary', range: null, justify: false, untagged: false };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--format' && argv[i + 1]) { args.format = argv[++i]; }
+    else if (a.startsWith('--format=')) { args.format = a.split('=')[1]; }
+    else if (a === '--range' && argv[i + 1]) { args.range = argv[++i]; }
+    else if (a.startsWith('--range=')) { args.range = a.split('=')[1]; }
+    else if (a === '--justify') { args.justify = true; args.format = 'justify'; }
+    else if (a === '--untagged') { args.untagged = true; args.format = 'untagged'; }
+    else if (a === '--session' && argv[i + 1]) { args.session = argv[++i]; args.format = 'session'; }
+    else if (a.startsWith('--session=')) { args.session = a.split('=')[1]; args.format = 'session'; }
+  }
+  return args;
+}
+
+// ── formatting helpers ───────────────────────────────────────────────────────
+
+function fmtTokens(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+  return String(n);
+}
+
+function tokenSummary(entry) {
+  const total = (entry.inputTokens || 0) + (entry.outputTokens || 0) +
+                (entry.cacheReadTokens || 0) + (entry.cacheCreationTokens || 0);
+  return fmtTokens(total);
+}
+
+// ── date range filter ─────────────────────────────────────────────────────────
+
+function parseRange(rangeStr) {
+  if (!rangeStr) return null;
+  // Supports: "2025-01-01:2025-01-31" or "2025-01-01:" or ":2025-01-31"
+  const [from, to] = rangeStr.split(':');
+  return {
+    from: from ? new Date(from + 'T00:00:00.000Z') : null,
+    to: to ? new Date(to + 'T23:59:59.999Z') : null,
+  };
+}
+
+function inRange(ts, range) {
+  if (!range) return true;
+  const d = new Date(ts);
+  if (range.from && d < range.from) return false;
+  if (range.to && d > range.to) return false;
+  return true;
+}
+
+// ── data loading ──────────────────────────────────────────────────────────────
+
+function loadAll(range) {
+  const config = loadJson(CONFIG_FILE);
+  const allActivity = loadJsonl(ACTIVITY_FILE);
+  const allCosts = loadJsonl(COSTS_FILE);
+  const sessions = loadJson(SESSIONS_FILE);
+
+  const activity = allActivity.filter(e => inRange(e.timestamp, range));
+  const toolCalls = activity.filter(e => e.event === 'tool_call');
+
+  const costsInRange = getCostsInRange(allCosts, range);
+  const totalCost = costsInRange.reduce((s, e) => s + (e.estimatedCost || 0), 0);
+
+  return { config, activity, toolCalls, sessions, costsInRange, totalCost };
+}
+
+// ── summary report ────────────────────────────────────────────────────────────
+
+function reportSummary(range) {
+  const { toolCalls, sessions, costsInRange, totalCost } = loadAll(range);
+
+  const totalToolCalls = toolCalls.length;
+
+  // Unique session IDs from tool calls
+  const sessionIds = new Set(toolCalls.map(e => e.sessionId).filter(Boolean));
+  const sessionCount = sessionIds.size;
+
+  // By session (from actual cost data)
+  const bySession = {};
+  for (const e of costsInRange) {
+    const sid = e.sessionId || 'unknown';
+    if (!bySession[sid]) bySession[sid] = { cost: 0, tokens: 0, project: e.project || 'unknown', branch: e.branch || null, summary: e.summary || null, model: e.model, timestamp: e.sessionTimestamp };
+    bySession[sid].cost += e.estimatedCost || 0;
+    bySession[sid].tokens += (e.inputTokens || 0) + (e.outputTokens || 0) + (e.cacheReadTokens || 0) + (e.cacheCreationTokens || 0);
+  }
+
+  // By project (from actual cost data)
+  const byProject = {};
+  for (const e of costsInRange) {
+    const proj = e.project || 'unknown';
+    if (!byProject[proj]) byProject[proj] = { cost: 0, tokens: 0 };
+    byProject[proj].cost += e.estimatedCost || 0;
+    byProject[proj].tokens += (e.inputTokens || 0) + (e.outputTokens || 0) + (e.cacheReadTokens || 0) + (e.cacheCreationTokens || 0);
+  }
+
+  // By stage
+  const byStage = {};
+  for (const e of toolCalls) {
+    const stage = (e.tags && e.tags.stage) || 'untagged';
+    byStage[stage] = (byStage[stage] || 0) + 1;
+  }
+
+  // By ticket
+  const byTicket = {};
+  for (const e of toolCalls) {
+    const ticket = (e.tags && e.tags.ticket) || null;
+    if (ticket) {
+      byTicket[ticket] = (byTicket[ticket] || 0) + 1;
+    }
+  }
+
+  // Untagged sessions (not in sessions.json)
+  const untaggedCount = [...sessionIds].filter(id => !sessions[id]).length;
+
+  // Output
+  const lines = [];
+  lines.push('');
+  lines.push('╔══════════════════════════════════════╗');
+  lines.push('║         Claude Cost Report           ║');
+  lines.push('╚══════════════════════════════════════╝');
+  lines.push('');
+  const totalTokens = costsInRange.reduce((s, e) => s + (e.inputTokens || 0) + (e.outputTokens || 0) + (e.cacheReadTokens || 0) + (e.cacheCreationTokens || 0), 0);
+  lines.push(`  Total estimated cost : $${totalCost.toFixed(4)}  (${fmtTokens(totalTokens)} tokens)`);
+  lines.push(`  Sessions             : ${sessionCount}`);
+  lines.push(`  Tool calls           : ${totalToolCalls}`);
+  lines.push(`  Untagged sessions    : ${untaggedCount}`);
+  lines.push('');
+
+  // Per-session breakdown with actual costs
+  if (Object.keys(bySession).length) {
+    lines.push('  By Session:');
+    const sorted = Object.entries(bySession).sort((a, b) => b[1].cost - a[1].cost);
+    for (const [sid, info] of sorted) {
+      const shortId = sid.slice(0, 8);
+      const pct = totalCost ? ((info.cost / totalCost) * 100).toFixed(1) : '0.0';
+      const time = info.timestamp ? info.timestamp.slice(11, 16) : '??:??';
+      // Prefer manual summary override from sessions.json, then harvested summary, then branch
+      const override = sessions[sid] && sessions[sid].summary;
+      const label = override || info.summary || info.branch || info.project || 'unknown';
+      const shortLabel = label.length > 40 ? label.slice(0, 37) + '...' : label;
+      lines.push(`    ${shortId}  ${time}  ${shortLabel.padEnd(40)} $${info.cost.toFixed(4).padStart(9)}  ${pct.padStart(5)}%  ${fmtTokens(info.tokens).padStart(7)} tok`);
+    }
+    lines.push('');
+  }
+
+  if (Object.keys(byProject).length) {
+    lines.push('  By Project:');
+    const sorted = Object.entries(byProject).sort((a, b) => b[1].cost - a[1].cost);
+    for (const [proj, info] of sorted) {
+      const pct = totalCost ? ((info.cost / totalCost) * 100).toFixed(1) : '0.0';
+      lines.push(`    ${proj.padEnd(30)} $${info.cost.toFixed(4).padStart(9)}  ${pct.padStart(5)}%  ${fmtTokens(info.tokens).padStart(7)} tok`);
+    }
+    lines.push('');
+  }
+
+  if (Object.keys(byStage).length) {
+    lines.push('  By Stage:');
+    const sorted = Object.entries(byStage).sort((a, b) => b[1] - a[1]);
+    for (const [stage, count] of sorted) {
+      const pct = totalToolCalls ? ((count / totalToolCalls) * 100).toFixed(1) : '0.0';
+      lines.push(`    ${stage.padEnd(20)} ${String(count).padStart(5)} calls  ${pct.padStart(5)}%`);
+    }
+    lines.push('');
+  }
+
+  if (Object.keys(byTicket).length) {
+    lines.push('  By Ticket:');
+    const sorted = Object.entries(byTicket).sort((a, b) => b[1] - a[1]);
+    for (const [ticket, count] of sorted) {
+      const pct = totalToolCalls ? ((count / totalToolCalls) * 100).toFixed(1) : '0.0';
+      lines.push(`    ${ticket.padEnd(20)} ${String(count).padStart(5)} calls  ${pct.padStart(5)}%`);
+    }
+    lines.push('');
+  }
+
+  console.log(lines.join('\n'));
+}
+
+// ── CSV report ────────────────────────────────────────────────────────────────
+
+function reportCsv(range) {
+  const { toolCalls, totalCost } = loadAll(range);
+  const totalToolCalls = toolCalls.length;
+
+  const headers = ['date', 'session_id', 'project', 'ticket', 'stage', 'tool_name', 'inferred_stage', 'allocated_cost'];
+  console.log(headers.join(','));
+
+  for (const e of toolCalls) {
+    const date = e.timestamp ? e.timestamp.slice(0, 10) : '';
+    const sessionId = e.sessionId || '';
+    const project = getProjectFromPath(e.project);
+    const ticket = (e.tags && e.tags.ticket) || '';
+    const stage = (e.tags && e.tags.stage) || '';
+    const toolName = e.toolName || '';
+    const inferredStage = stage; // same source for now
+    const allocatedCost = totalToolCalls ? (totalCost / totalToolCalls).toFixed(6) : '0';
+
+    const row = [date, sessionId, project, ticket, stage, toolName, inferredStage, allocatedCost]
+      .map(v => `"${String(v).replace(/"/g, '""')}"`)
+      .join(',');
+    console.log(row);
+  }
+
+  // Cost summary rows
+  console.log('');
+  console.log('"# Cost Summary"');
+  console.log('"model","input_tokens","output_tokens","cache_read_tokens","cache_write_tokens","estimated_cost"');
+  const { costsInRange } = loadAll(range);
+  for (const c of costsInRange) {
+    console.log([
+      `"${c.model}"`,
+      c.inputTokens || 0,
+      c.outputTokens || 0,
+      c.cacheReadTokens || 0,
+      c.cacheCreationTokens || 0,
+      (c.estimatedCost || 0).toFixed(6),
+    ].join(','));
+  }
+}
+
+// ── justify report ────────────────────────────────────────────────────────────
+
+function reportJustify(range) {
+  const { config, activity, sessions, costsInRange, totalCost } = loadAll(range);
+
+  const defaultMultiplier = config.roiMultiplier || 2;
+  const stageMultipliers = config.roiMultiplierByStage || {};
+  const engineerHourlyRate = config.engineerHourlyRate || 100;
+
+  function getMultiplier(stage) {
+    return stageMultipliers[stage] || defaultMultiplier;
+  }
+
+  // Build per-session cost/token data from costsInRange
+  const sessionData = {};
+  for (const e of costsInRange) {
+    const sid = e.sessionId || 'unknown';
+    if (!sessionData[sid]) sessionData[sid] = { cost: 0, tokens: 0, summary: e.summary || null };
+    sessionData[sid].cost += e.estimatedCost || 0;
+    sessionData[sid].tokens += (e.inputTokens || 0) + (e.outputTokens || 0) + (e.cacheReadTokens || 0) + (e.cacheCreationTokens || 0);
+  }
+
+  // Resolve ticket per session: prefer sessions.json, fall back to activity inline tags
+  const sessionTickets = {};
+  for (const sid of Object.keys(sessionData)) {
+    if (sessions[sid] && sessions[sid].ticket) {
+      sessionTickets[sid] = sessions[sid].ticket;
+    }
+  }
+  // Fill in from activity inline tags for sessions not in sessions.json
+  for (const e of activity) {
+    const sid = e.sessionId;
+    if (sid && !sessionTickets[sid] && e.tags && e.tags.ticket) {
+      sessionTickets[sid] = e.tags.ticket;
+    }
+  }
+
+  // For duration: group activity by sessionId, find first+last timestamp
+  const sessionTimestamps = {};
+  for (const e of activity) {
+    if (!e.sessionId) continue;
+    if (!sessionTimestamps[e.sessionId]) sessionTimestamps[e.sessionId] = { first: e.timestamp, last: e.timestamp };
+    else {
+      if (e.timestamp < sessionTimestamps[e.sessionId].first) sessionTimestamps[e.sessionId].first = e.timestamp;
+      if (e.timestamp > sessionTimestamps[e.sessionId].last) sessionTimestamps[e.sessionId].last = e.timestamp;
+    }
+  }
+
+  // Group sessions by ticket
+  const byTicket = {};
+  for (const [sid, data] of Object.entries(sessionData)) {
+    const ticket = sessionTickets[sid] || '_untagged';
+    if (!byTicket[ticket]) byTicket[ticket] = [];
+    const summary = (sessions[sid] && sessions[sid].summary) || data.summary || sid.slice(0, 8);
+    byTicket[ticket].push({ sid, ...data, summary });
+  }
+
+  const totalTokens = costsInRange.reduce((s, e) => s + (e.inputTokens || 0) + (e.outputTokens || 0) + (e.cacheReadTokens || 0) + (e.cacheCreationTokens || 0), 0);
+
+  const lines = [];
+  lines.push('');
+  lines.push('╔══════════════════════════════════════╗');
+  lines.push('║      Claude ROI Justification        ║');
+  lines.push('╚══════════════════════════════════════╝');
+  lines.push('');
+  const multiplierStr = Object.entries(stageMultipliers).length
+    ? Object.entries(stageMultipliers).map(([s, m]) => `${s}:${m}x`).join(', ')
+    : `${defaultMultiplier}x (flat)`;
+  lines.push(`  ROI Multipliers       : ${multiplierStr}`);
+  lines.push(`  Engineer Hourly Rate  : $${engineerHourlyRate}/hr`);
+  lines.push(`  Total Estimated Cost  : $${totalCost.toFixed(4)}  (${fmtTokens(totalTokens)} tokens)`);
+  lines.push('');
+
+  let grandEngineerCost = 0;
+  let grandWithClaude = 0;
+  let grandWeightedHours = 0;
+
+  const sorted = Object.entries(byTicket).sort((a, b) => {
+    const costA = a[1].reduce((s, e) => s + e.cost, 0);
+    const costB = b[1].reduce((s, e) => s + e.cost, 0);
+    return costB - costA;
+  });
+
+  for (const [ticket, sessionsInTicket] of sorted) {
+    const ticketCost = sessionsInTicket.reduce((s, e) => s + e.cost, 0);
+    const ticketTokens = sessionsInTicket.reduce((s, e) => s + e.tokens, 0);
+    const pct = totalCost ? ((ticketCost / totalCost) * 100).toFixed(1) : '0.0';
+
+    // Duration: sum of (last - first) per session
+    let totalDurationMs = 0;
+    for (const s of sessionsInTicket) {
+      const ts = sessionTimestamps[s.sid];
+      if (ts) {
+        totalDurationMs += new Date(ts.last) - new Date(ts.first);
+      }
+    }
+    const withClaudeHours = totalDurationMs / 3_600_000;
+
+    // Compute weighted multiplier from stage breakdown across all sessions in this ticket
+    // Read each session JSONL to get per-stage cost distribution
+    let totalStageCost = 0;
+    let weightedMultiplierSum = 0;
+    for (const s of sessionsInTicket) {
+      // Quick scan: use activity log tool calls to estimate stage distribution
+      const sessionCalls = activity.filter(e => e.sessionId === s.sid && e.event === 'tool_call');
+      const stageCounts = {};
+      for (const e of sessionCalls) {
+        const stage = (e.tags && e.tags.stage) || 'other';
+        stageCounts[stage] = (stageCounts[stage] || 0) + 1;
+      }
+      const totalCalls = Object.values(stageCounts).reduce((a, b) => a + b, 0) || 1;
+      for (const [stage, count] of Object.entries(stageCounts)) {
+        const fraction = count / totalCalls;
+        const stageCostShare = s.cost * fraction;
+        weightedMultiplierSum += stageCostShare * getMultiplier(stage);
+        totalStageCost += stageCostShare;
+      }
+      // If no tool calls, attribute to thinking
+      if (Object.keys(stageCounts).length === 0) {
+        weightedMultiplierSum += s.cost * getMultiplier('thinking');
+        totalStageCost += s.cost;
+      }
+    }
+    const blendedMultiplier = totalStageCost > 0 ? weightedMultiplierSum / totalStageCost : defaultMultiplier;
+    const withoutClaudeHours = withClaudeHours * blendedMultiplier;
+    const engineerCost = withoutClaudeHours * engineerHourlyRate;
+
+    grandEngineerCost += engineerCost;
+    grandWithClaude += withClaudeHours;
+    grandWeightedHours += withoutClaudeHours;
+
+    lines.push(`  ── ${ticket} ──`);
+    lines.push(`     Cost          : $${ticketCost.toFixed(4)}  (${pct}%)  ${fmtTokens(ticketTokens)} tok`);
+    lines.push(`     Sessions      : ${sessionsInTicket.length}`);
+    lines.push(`     With Claude   : ${withClaudeHours.toFixed(2)} hrs`);
+    lines.push(`     Without Claude: ${withoutClaudeHours.toFixed(2)} hrs (est. @ ${blendedMultiplier.toFixed(1)}x blended)`);
+    lines.push(`     Engineer cost : $${engineerCost.toFixed(2)} (avoided)`);
+
+    // List sessions within this ticket
+    const sortedSessions = sessionsInTicket.sort((a, b) => b.cost - a.cost);
+    for (const s of sortedSessions) {
+      const shortLabel = s.summary.length > 35 ? s.summary.slice(0, 32) + '...' : s.summary;
+      lines.push(`       ${s.sid.slice(0, 8)}  ${shortLabel.padEnd(35)} $${s.cost.toFixed(4).padStart(9)}  ${fmtTokens(s.tokens).padStart(7)} tok`);
+    }
+    lines.push('');
+  }
+
+  // Grand total ROI
+  lines.push(`  ROI Summary:`);
+  lines.push(`    Total engineer hours avoided : ${grandWeightedHours.toFixed(2)} hrs`);
+  lines.push(`    Total engineer cost avoided  : $${grandEngineerCost.toFixed(2)}`);
+  lines.push(`    Claude cost                  : $${totalCost.toFixed(4)}  (${fmtTokens(totalTokens)} tokens)`);
+  if (totalCost > 0) {
+    lines.push(`    ROI ratio                    : ${(grandEngineerCost / totalCost).toFixed(1)}x`);
+  }
+  lines.push('');
+
+  console.log(lines.join('\n'));
+}
+
+// ── untagged report ───────────────────────────────────────────────────────────
+
+function reportUntagged(range) {
+  const { toolCalls, sessions } = loadAll(range);
+
+  const sessionIds = new Set(toolCalls.map(e => e.sessionId).filter(Boolean));
+  const untagged = [...sessionIds].filter(id => !sessions[id]);
+
+  const lines = [];
+  lines.push('');
+  lines.push('  Untagged Sessions (no ticket/tags in sessions.json):');
+  lines.push('');
+
+  if (untagged.length === 0) {
+    lines.push('  All sessions are tagged.');
+  } else {
+    // Gather per-session info from tool calls
+    for (const sid of untagged) {
+      const calls = toolCalls.filter(e => e.sessionId === sid);
+      const project = calls[0] ? getProjectFromPath(calls[0].project) : 'unknown';
+      const firstTs = calls.reduce((m, e) => e.timestamp < m ? e.timestamp : m, calls[0] ? calls[0].timestamp : '');
+      lines.push(`  • ${sid}`);
+      lines.push(`      project   : ${project}`);
+      lines.push(`      date      : ${firstTs ? firstTs.slice(0, 10) : 'unknown'}`);
+      lines.push(`      tool calls: ${calls.length}`);
+    }
+  }
+  lines.push('');
+  console.log(lines.join('\n'));
+}
+
+// ── session detail report ────────────────────────────────────────────────────
+
+const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+
+function inferStageFromToolName(name) {
+  if (!name) return 'other';
+  const n = name.toLowerCase();
+  if (n === 'read' || n === 'grep' || n === 'glob' || n === 'websearch' || n === 'webfetch') return 'research';
+  if (n === 'edit' || n === 'write' || n === 'notebookedit') return 'implementation';
+  if (n === 'bash') return 'execution';
+  if (n === 'agent') return 'agent';
+  return 'other';
+}
+
+function inferStageFromBashCmd(input) {
+  if (!input) return 'execution';
+  const cmd = (typeof input === 'string' ? input : (input.command || '')).toLowerCase();
+  if (/\b(test|jest|mocha|vitest|pytest|npm test|yarn test|spec)\b/.test(cmd)) return 'testing';
+  if (/\b(lint|eslint|golangci)\b/.test(cmd)) return 'review';
+  return 'execution';
+}
+
+function reportSession(sessionIdPrefix) {
+  const config = loadJson(CONFIG_FILE);
+  const sessions = loadJson(SESSIONS_FILE);
+  const pricing = config.pricing || {};
+
+  const FALLBACK_PRICING = { input: 3.0, output: 15.0, cacheRead: 0.375, cacheWrite: 3.75 };
+
+  // Find session JSONL file matching prefix
+  let sessionFile = null;
+  let fullSessionId = null;
+
+  try {
+    const projectDirs = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => path.join(PROJECTS_DIR, d.name));
+
+    for (const dir of projectDirs) {
+      const files = fs.readdirSync(dir).filter(f => f.endsWith('.jsonl') && f.startsWith(sessionIdPrefix));
+      if (files.length) {
+        sessionFile = path.join(dir, files[0]);
+        fullSessionId = path.basename(files[0], '.jsonl');
+        break;
+      }
+    }
+  } catch (_) {}
+
+  if (!sessionFile) {
+    console.error(`  No session found matching "${sessionIdPrefix}"`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // Parse session JSONL: extract per-turn cost and tools used
+  const turns = [];
+  let sessionSummary = null;
+
+  try {
+    const content = fs.readFileSync(sessionFile, 'utf8');
+    const fileLines = content.split('\n').filter(Boolean);
+
+    for (const line of fileLines) {
+      const obj = JSON.parse(line);
+
+      if (obj.type === 'assistant' && obj.message && obj.message.usage) {
+        const model = obj.message.model || 'unknown';
+        const u = obj.message.usage;
+        const mp = pricing[model] || FALLBACK_PRICING;
+        const M = 1_000_000;
+        const cost = (
+          ((u.input_tokens || 0) * mp.input / M) +
+          ((u.output_tokens || 0) * mp.output / M) +
+          ((u.cache_read_input_tokens || 0) * mp.cacheRead / M) +
+          ((u.cache_creation_input_tokens || 0) * mp.cacheWrite / M)
+        );
+
+        // Extract tool names from content blocks
+        const tools = [];
+        if (Array.isArray(obj.message.content)) {
+          for (const block of obj.message.content) {
+            if (block.type === 'tool_use' && block.name) {
+              tools.push({ name: block.name, input: block.input });
+            }
+          }
+        }
+
+        // Determine stage(s) for this turn
+        const stages = {};
+        if (tools.length === 0) {
+          stages['thinking'] = cost;
+        } else {
+          const perTool = cost / tools.length;
+          for (const t of tools) {
+            let stage;
+            if (t.name.toLowerCase() === 'bash') {
+              stage = inferStageFromBashCmd(t.input);
+            } else {
+              stage = inferStageFromToolName(t.name);
+            }
+            stages[stage] = (stages[stage] || 0) + perTool;
+          }
+        }
+
+        turns.push({
+          cost,
+          model,
+          tools: tools.map(t => t.name),
+          stages,
+          inputTokens: u.input_tokens || 0,
+          outputTokens: u.output_tokens || 0,
+          cacheRead: u.cache_read_input_tokens || 0,
+          cacheWrite: u.cache_creation_input_tokens || 0,
+          timestamp: obj.timestamp,
+        });
+      }
+    }
+  } catch (err) {
+    console.error(`  Error reading session file: ${err.message}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // Aggregate
+  const totalCost = turns.reduce((s, t) => s + t.cost, 0);
+  const totalIn = turns.reduce((s, t) => s + t.inputTokens, 0);
+  const totalOut = turns.reduce((s, t) => s + t.outputTokens, 0);
+  const totalCR = turns.reduce((s, t) => s + t.cacheRead, 0);
+  const totalCW = turns.reduce((s, t) => s + t.cacheWrite, 0);
+
+  // By stage — distribute tokens proportionally like cost
+  const byStage = {};
+  for (const t of turns) {
+    const turnTokens = t.inputTokens + t.outputTokens + t.cacheRead + t.cacheWrite;
+    for (const [stage, cost] of Object.entries(t.stages)) {
+      if (!byStage[stage]) byStage[stage] = { cost: 0, tokens: 0, turns: 0 };
+      byStage[stage].cost += cost;
+      byStage[stage].turns++;
+      // Distribute tokens proportionally to cost share within this turn
+      const share = t.cost > 0 ? cost / t.cost : 1 / Object.keys(t.stages).length;
+      byStage[stage].tokens += Math.round(turnTokens * share);
+    }
+  }
+
+  // Top turns by cost
+  const topTurns = [...turns].sort((a, b) => b.cost - a.cost).slice(0, 10);
+
+  // Session metadata
+  const meta = sessions[fullSessionId] || {};
+  const label = meta.summary || fullSessionId;
+
+  const lines = [];
+  lines.push('');
+  lines.push('╔══════════════════════════════════════╗');
+  lines.push('║       Session Detail Report          ║');
+  lines.push('╚══════════════════════════════════════╝');
+  lines.push('');
+  lines.push(`  Session  : ${fullSessionId}`);
+  lines.push(`  Summary  : ${label}`);
+  if (meta.ticket) lines.push(`  Ticket   : ${meta.ticket}`);
+  lines.push(`  Turns    : ${turns.length}`);
+  lines.push(`  Cost     : $${totalCost.toFixed(4)}`);
+  lines.push(`  Tokens   : in=${totalIn.toLocaleString()}  out=${totalOut.toLocaleString()}  cacheRead=${totalCR.toLocaleString()}  cacheWrite=${totalCW.toLocaleString()}`);
+  lines.push('');
+
+  // Stage breakdown
+  lines.push('  By Stage:');
+  const sortedStages = Object.entries(byStage).sort((a, b) => b[1].cost - a[1].cost);
+  for (const [stage, info] of sortedStages) {
+    const pct = totalCost ? ((info.cost / totalCost) * 100).toFixed(1) : '0.0';
+    lines.push(`    ${stage.padEnd(20)} $${info.cost.toFixed(4).padStart(9)}  ${pct.padStart(5)}%  ${fmtTokens(info.tokens).padStart(7)} tok  (${info.turns} turns)`);
+  }
+  lines.push('');
+
+  // Most expensive turns
+  lines.push('  Most Expensive Turns:');
+  for (let i = 0; i < topTurns.length; i++) {
+    const t = topTurns[i];
+    const pct = totalCost ? ((t.cost / totalCost) * 100).toFixed(1) : '0.0';
+    const toolStr = t.tools.length ? t.tools.join(', ') : '(no tools — thinking)';
+    const time = t.timestamp ? t.timestamp.slice(11, 19) : '??:??:??';
+    const turnTok = t.inputTokens + t.outputTokens + t.cacheRead + t.cacheWrite;
+    lines.push(`    ${String(i + 1).padStart(2)}.  ${time}  $${t.cost.toFixed(4).padStart(9)}  ${pct.padStart(5)}%  ${fmtTokens(turnTok).padStart(7)} tok  ${toolStr}`);
+  }
+  lines.push('');
+
+  console.log(lines.join('\n'));
+}
+
+// ── main ──────────────────────────────────────────────────────────────────────
+
+function main() {
+  const args = parseArgs(process.argv);
+  const range = parseRange(args.range);
+
+  if (args.format === 'session') {
+    reportSession(args.session);
+  } else if (args.format === 'csv') {
+    reportCsv(range);
+  } else if (args.format === 'justify') {
+    reportJustify(range);
+  } else if (args.format === 'untagged') {
+    reportUntagged(range);
+  } else {
+    reportSummary(range);
+  }
+}
+
+main();

@@ -1,0 +1,168 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+const BASE_DIR = process.env.COST_TRACKER_DIR || path.join(process.env.HOME, '.claude', 'cost-tracker');
+const ACTIVITY_FILE = path.join(BASE_DIR, 'activity.jsonl');
+const SESSIONS_FILE = path.join(BASE_DIR, 'tags', 'sessions.json');
+
+function loadSessions() {
+  try {
+    const raw = fs.readFileSync(SESSIONS_FILE, 'utf8').trim();
+    return raw ? JSON.parse(raw) : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveSessions(sessions) {
+  fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2) + '\n', 'utf8');
+}
+
+function parseArgs(argv) {
+  const args = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--list-untagged') {
+      args.listUntagged = true;
+    } else if (arg.startsWith('--') && i + 1 < argv.length && !argv[i + 1].startsWith('--')) {
+      args[arg.slice(2)] = argv[i + 1];
+      i++;
+    }
+  }
+  return args;
+}
+
+function printUsage() {
+  console.log(`cost-tag - Manual session tagging CLI
+
+Usage:
+  cost-tag --session <id> --ticket <TICKET>     Tag a session with a ticket ID
+  cost-tag --session <id> --stage <stage>       Tag a session with a stage
+  cost-tag --session <id> --note <text>         Add a note to a session
+  cost-tag --session <id> --summary <text>      Override the session summary
+  cost-tag --list-untagged                      List sessions without tags in sessions.json
+
+Examples:
+  cost-tag --session sess-abc123 --ticket ENG-456
+  cost-tag --session sess-abc123 --summary "build cost tracker"
+  cost-tag --list-untagged
+`);
+}
+
+function tagSession(sessionId, updates) {
+  const sessions = loadSessions();
+  if (!sessions[sessionId]) {
+    sessions[sessionId] = {};
+  }
+  Object.assign(sessions[sessionId], updates);
+  sessions[sessionId].taggedAt = new Date().toISOString();
+  saveSessions(sessions);
+  console.log(`Tagged session ${sessionId}:`);
+  for (const [k, v] of Object.entries(updates)) {
+    console.log(`  ${k}: ${v}`);
+  }
+}
+
+function listUntagged() {
+  // Scan activity.jsonl for all session IDs
+  let activityLines = [];
+  try {
+    activityLines = fs.readFileSync(ACTIVITY_FILE, 'utf8').split('\n').filter(Boolean);
+  } catch (_) {
+    console.log('No activity.jsonl found.');
+    return;
+  }
+
+  // Build per-session info
+  const sessionMap = {}; // sessionId -> { project, firstSeen, lastSeen, toolCallCount, inlineTicket }
+
+  for (const line of activityLines) {
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch (_) {
+      continue;
+    }
+    const sid = entry.sessionId;
+    if (!sid) continue;
+
+    if (!sessionMap[sid]) {
+      sessionMap[sid] = {
+        project: entry.project || null,
+        firstSeen: entry.timestamp,
+        lastSeen: entry.timestamp,
+        toolCallCount: 0,
+        inlineTicket: null,
+      };
+    }
+
+    const s = sessionMap[sid];
+    if (entry.timestamp < s.firstSeen) s.firstSeen = entry.timestamp;
+    if (entry.timestamp > s.lastSeen) s.lastSeen = entry.timestamp;
+    if (entry.event === 'tool_call') s.toolCallCount++;
+
+    // Check for inline ticket tag
+    if (entry.tags && entry.tags.ticket && !s.inlineTicket) {
+      s.inlineTicket = entry.tags.ticket;
+    }
+  }
+
+  const sessions = loadSessions();
+
+  // Untagged = no entry in sessions.json (or entry has no ticket/stage/note)
+  const untagged = Object.entries(sessionMap).filter(([sid]) => {
+    return !sessions[sid];
+  });
+
+  if (untagged.length === 0) {
+    console.log('No untagged sessions found.');
+    return;
+  }
+
+  console.log(`Untagged sessions (${untagged.length}):\n`);
+  for (const [sid, info] of untagged) {
+    const project = info.project ? path.basename(info.project) : '(unknown)';
+    const first = info.firstSeen ? new Date(info.firstSeen).toLocaleString() : 'unknown';
+    const last = info.lastSeen ? new Date(info.lastSeen).toLocaleString() : 'unknown';
+    const inline = info.inlineTicket ? ` [inline: ${info.inlineTicket}]` : '';
+    console.log(`  ${sid}${inline}`);
+    console.log(`    project:    ${project}`);
+    console.log(`    tool calls: ${info.toolCallCount}`);
+    console.log(`    first seen: ${first}`);
+    console.log(`    last seen:  ${last}`);
+    console.log();
+  }
+}
+
+function main() {
+  const args = parseArgs(process.argv.slice(2));
+
+  if (args.listUntagged) {
+    listUntagged();
+    return;
+  }
+
+  if (!args.session) {
+    printUsage();
+    return;
+  }
+
+  const updates = {};
+  if (args.ticket) updates.ticket = args.ticket;
+  if (args.stage) updates.stage = args.stage;
+  if (args.note) updates.note = args.note;
+  if (args.summary) updates.summary = args.summary;
+
+  if (Object.keys(updates).length === 0) {
+    console.error('Error: specify at least one of --ticket, --stage, --note');
+    process.exitCode = 1;
+    return;
+  }
+
+  tagSession(args.session, updates);
+}
+
+main();
