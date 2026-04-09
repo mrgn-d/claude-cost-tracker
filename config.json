@@ -3,26 +3,26 @@
     "claude-opus-4-6": {
       "input": 3.0,
       "output": 15.0,
-      "cacheRead": 0.375,
-      "cacheWrite": 3.75
+      "cacheRead": 0.2427,
+      "cacheWrite": 2.4265
     },
     "claude-opus-4-5-20251101": {
       "input": 3.0,
       "output": 15.0,
-      "cacheRead": 0.375,
-      "cacheWrite": 3.75
+      "cacheRead": 0.2427,
+      "cacheWrite": 2.4265
     },
     "claude-sonnet-4-6": {
       "input": 3.0,
       "output": 15.0,
-      "cacheRead": 0.375,
-      "cacheWrite": 3.75
+      "cacheRead": 0.2427,
+      "cacheWrite": 2.4265
     },
     "claude-sonnet-4-5-20250929": {
       "input": 3.0,
       "output": 15.0,
-      "cacheRead": 0.375,
-      "cacheWrite": 3.75
+      "cacheRead": 0.2427,
+      "cacheWrite": 2.4265
     }
   },
   "roiMultiplierByStage": {

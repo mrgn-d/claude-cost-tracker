@@ -384,12 +384,11 @@ function reportJustify(range) {
     }
     const withClaudeHours = totalDurationMs / 3_600_000;
 
-    // Compute weighted multiplier from stage breakdown across all sessions in this ticket
-    // Read each session JSONL to get per-stage cost distribution
+    // Compute weighted multiplier and per-stage costs from activity log
     let totalStageCost = 0;
     let weightedMultiplierSum = 0;
+    const stageCosts = {};
     for (const s of sessionsInTicket) {
-      // Quick scan: use activity log tool calls to estimate stage distribution
       const sessionCalls = activity.filter(e => e.sessionId === s.sid && e.event === 'tool_call');
       const stageCounts = {};
       for (const e of sessionCalls) {
@@ -402,11 +401,13 @@ function reportJustify(range) {
         const stageCostShare = s.cost * fraction;
         weightedMultiplierSum += stageCostShare * getMultiplier(stage);
         totalStageCost += stageCostShare;
+        stageCosts[stage] = (stageCosts[stage] || 0) + stageCostShare;
       }
       // If no tool calls, attribute to thinking
       if (Object.keys(stageCounts).length === 0) {
         weightedMultiplierSum += s.cost * getMultiplier('thinking');
         totalStageCost += s.cost;
+        stageCosts['thinking'] = (stageCosts['thinking'] || 0) + s.cost;
       }
     }
     const blendedMultiplier = totalStageCost > 0 ? weightedMultiplierSum / totalStageCost : defaultMultiplier;
@@ -417,18 +418,15 @@ function reportJustify(range) {
     grandWithClaude += withClaudeHours;
     grandWeightedHours += withoutClaudeHours;
 
-    lines.push(`  ── ${ticket} ──`);
-    lines.push(`     Cost          : $${ticketCost.toFixed(4)}  (${pct}%)  ${fmtTokens(ticketTokens)} tok`);
-    lines.push(`     Sessions      : ${sessionsInTicket.length}`);
-    lines.push(`     With Claude   : ${withClaudeHours.toFixed(2)} hrs`);
-    lines.push(`     Without Claude: ${withoutClaudeHours.toFixed(2)} hrs (est. @ ${blendedMultiplier.toFixed(1)}x blended)`);
-    lines.push(`     Engineer cost : $${engineerCost.toFixed(2)} (avoided)`);
+    lines.push(`  ── ${ticket} ──  $${ticketCost.toFixed(4)}  (${pct}%)  ${fmtTokens(ticketTokens)} tok`);
+    lines.push(`     ${sessionsInTicket.length} sessions  |  ${withClaudeHours.toFixed(2)} hrs active  |  ~${withoutClaudeHours.toFixed(1)} hrs manual (${blendedMultiplier.toFixed(1)}x)  |  $${engineerCost.toFixed(0)} avoided`);
 
-    // List sessions within this ticket
-    const sortedSessions = sessionsInTicket.sort((a, b) => b.cost - a.cost);
-    for (const s of sortedSessions) {
-      const shortLabel = s.summary.length > 35 ? s.summary.slice(0, 32) + '...' : s.summary;
-      lines.push(`       ${s.sid.slice(0, 8)}  ${shortLabel.padEnd(35)} $${s.cost.toFixed(4).padStart(9)}  ${fmtTokens(s.tokens).padStart(7)} tok`);
+    // Stage cost breakdown for this ticket
+    const sortedStageCosts = Object.entries(stageCosts).sort((a, b) => b[1] - a[1]);
+    for (const [stage, cost] of sortedStageCosts) {
+      const stagePct = ticketCost ? ((cost / ticketCost) * 100).toFixed(1) : '0.0';
+      const mult = getMultiplier(stage);
+      lines.push(`       ${stage.padEnd(18)} $${cost.toFixed(4).padStart(9)}  ${stagePct.padStart(5)}%  (${mult}x)`);
     }
     lines.push('');
   }
