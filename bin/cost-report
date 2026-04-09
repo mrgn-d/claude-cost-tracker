@@ -316,15 +316,25 @@ function reportJustify(range) {
     }
   }
 
-  // For duration: group activity by sessionId, find first+last timestamp
-  const sessionTimestamps = {};
+  // For duration: sum active time per session (gaps > idle threshold are dropped)
+  const IDLE_THRESHOLD_MS = (config.idleThresholdMinutes || 5) * 60 * 1000;
+  const sessionActiveMs = {};
+  const sessionEvents = {};
   for (const e of activity) {
-    if (!e.sessionId) continue;
-    if (!sessionTimestamps[e.sessionId]) sessionTimestamps[e.sessionId] = { first: e.timestamp, last: e.timestamp };
-    else {
-      if (e.timestamp < sessionTimestamps[e.sessionId].first) sessionTimestamps[e.sessionId].first = e.timestamp;
-      if (e.timestamp > sessionTimestamps[e.sessionId].last) sessionTimestamps[e.sessionId].last = e.timestamp;
+    if (!e.sessionId || !e.timestamp) continue;
+    if (!sessionEvents[e.sessionId]) sessionEvents[e.sessionId] = [];
+    sessionEvents[e.sessionId].push(new Date(e.timestamp).getTime());
+  }
+  for (const [sid, timestamps] of Object.entries(sessionEvents)) {
+    timestamps.sort((a, b) => a - b);
+    let activeMs = 0;
+    for (let i = 1; i < timestamps.length; i++) {
+      const gap = timestamps[i] - timestamps[i - 1];
+      if (gap <= IDLE_THRESHOLD_MS) {
+        activeMs += gap;
+      }
     }
+    sessionActiveMs[sid] = activeMs;
   }
 
   // Group sessions by ticket
@@ -367,13 +377,10 @@ function reportJustify(range) {
     const ticketTokens = sessionsInTicket.reduce((s, e) => s + e.tokens, 0);
     const pct = totalCost ? ((ticketCost / totalCost) * 100).toFixed(1) : '0.0';
 
-    // Duration: sum of (last - first) per session
+    // Duration: sum active time per session (idle gaps excluded)
     let totalDurationMs = 0;
     for (const s of sessionsInTicket) {
-      const ts = sessionTimestamps[s.sid];
-      if (ts) {
-        totalDurationMs += new Date(ts.last) - new Date(ts.first);
-      }
+      totalDurationMs += sessionActiveMs[s.sid] || 0;
     }
     const withClaudeHours = totalDurationMs / 3_600_000;
 
