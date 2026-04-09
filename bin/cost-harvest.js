@@ -147,24 +147,27 @@ async function main() {
 
   const lastHarvest = readJson(LAST_HARVEST_PATH) || {};
   const lastHarvestTime = lastHarvest.harvestedAt ? new Date(lastHarvest.harvestedAt).getTime() : 0;
-  const harvestedSessions = new Set(lastHarvest.harvestedSessions || []);
   const pricing = config.pricing || {};
   const harvestedAt = new Date().toISOString();
 
-  // Find session files modified since last harvest
+  // Find session files modified since last harvest (re-scans active sessions too)
   const sessionFiles = findSessionFiles(lastHarvestTime);
 
+  // Load existing costs so we can replace stale entries for re-harvested sessions
+  let existingCosts = [];
+  try {
+    existingCosts = fs.readFileSync(COSTS_JSONL_PATH, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+  } catch (_) {}
+
   const entries = [];
-  const newlyHarvested = [];
+  const harvestedIds = new Set();
 
   for (const sf of sessionFiles) {
-    // Skip if we already harvested this session (file may have been touched without new data)
-    if (harvestedSessions.has(sf.sessionId)) continue;
-
     const usage = sumSessionUsage(sf.path);
     if (!usage) continue;
 
     const project = getProjectFromPath(usage.cwd || sf.projectDir);
+    const sid = usage.sessionId || sf.sessionId;
 
     for (const [model, tokens] of Object.entries(usage.byModel)) {
       if (tokens.inputTokens === 0 && tokens.outputTokens === 0 &&
@@ -187,7 +190,7 @@ async function main() {
         cacheCreationTokens: tokens.cacheWrite,
         estimatedCost,
         harvestedAt,
-        sessionId: usage.sessionId || sf.sessionId,
+        sessionId: sid,
         project,
         branch: usage.gitBranch || null,
         summary: usage.firstPrompt || null,
@@ -195,22 +198,19 @@ async function main() {
       });
     }
 
-    newlyHarvested.push(sf.sessionId);
+    harvestedIds.add(sid);
   }
 
-  // Append entries to costs.jsonl
-  if (entries.length) {
-    const lines = entries.map(e => JSON.stringify(e)).join('\n') + '\n';
-    fs.appendFileSync(COSTS_JSONL_PATH, lines, 'utf8');
-  }
+  // Merge: keep old entries for sessions we didn't re-scan, replace ones we did
+  const kept = existingCosts.filter(e => !harvestedIds.has(e.sessionId));
+  const merged = [...kept, ...entries];
 
-  // Update last harvest state — keep track of harvested session IDs
-  // Only keep IDs from last 7 days to prevent unbounded growth
-  const allHarvested = [...harvestedSessions, ...newlyHarvested];
-  writeJson(LAST_HARVEST_PATH, {
-    harvestedAt,
-    harvestedSessions: allHarvested.slice(-500),
-  });
+  // Rewrite costs.jsonl
+  const lines = merged.map(e => JSON.stringify(e)).join('\n') + (merged.length ? '\n' : '');
+  fs.writeFileSync(COSTS_JSONL_PATH, lines, 'utf8');
+
+  // Update last harvest timestamp
+  writeJson(LAST_HARVEST_PATH, { harvestedAt });
 
   const totalCost = entries.reduce((sum, e) => sum + e.estimatedCost, 0);
   if (entries.length) {
