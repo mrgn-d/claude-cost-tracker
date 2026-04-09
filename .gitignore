@@ -1,5 +1,12 @@
-# Data files (user-specific)
+# User data (created at runtime)
 activity.jsonl
 costs.jsonl
 last-harvest.json
 tags/
+data/
+
+# OS
+.DS_Store
+
+# Node
+node_modules/

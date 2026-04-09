@@ -1,0 +1,14 @@
+{
+  "name": "cost-tracker",
+  "version": "1.0.0",
+  "description": "Track Claude Code session costs, tag sessions with tickets, and generate ROI reports",
+  "author": {
+    "name": "Morgan Dedmon",
+    "url": "https://github.com/mrgn-d"
+  },
+  "homepage": "https://github.com/mrgn-d/claude-cost-tracker",
+  "repository": "https://github.com/mrgn-d/claude-cost-tracker",
+  "license": "MIT",
+  "keywords": ["cost", "tracking", "billing", "ROI", "usage"],
+  "skills": "./skills/"
+}
