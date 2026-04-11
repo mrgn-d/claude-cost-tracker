@@ -13,7 +13,9 @@ Hook-based cost tracking for [Claude Code](https://docs.anthropic.com/en/docs/cl
 
 ## Install
 
-Add to your Claude Code `~/.claude/settings.json`:
+### As a Claude Code plugin
+
+Add both entries to your `~/.claude/settings.json`:
 
 ```json
 {
@@ -24,24 +26,19 @@ Add to your Claude Code `~/.claude/settings.json`:
         "repo": "mrgn-d/claude-cost-tracker"
       }
     }
-  }
-}
-```
-
-Then enable the plugin:
-
-```json
-{
+  },
   "enabledPlugins": {
     "cost-tracker@claude-cost-tracker": true
   }
 }
 ```
 
-Run setup to initialize the data directory:
+Restart Claude Code. The plugin auto-registers its hooks on startup. On first session start, the data directory (`~/.claude/cost-tracker/data/`) is created automatically.
+
+To verify it's working, start a new session and check for data:
 
 ```bash
-node ~/.claude/plugins/marketplaces/claude-cost-tracker/bin/setup.js
+cat ~/.claude/cost-tracker/data/activity.jsonl
 ```
 
 ### Manual install
