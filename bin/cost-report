@@ -197,7 +197,9 @@ function reportSummary(range) {
       const time = info.timestamp ? info.timestamp.slice(11, 16) : '??:??';
       // Prefer manual summary override from sessions.json, then harvested summary, then branch
       const override = sessions[sid] && sessions[sid].summary;
-      const label = override || info.summary || info.branch || info.project || 'unknown';
+      const ticket = sessions[sid] && sessions[sid].ticket;
+      const baseSummary = override || info.summary || info.branch || info.project || 'unknown';
+      const label = (ticket && !baseSummary.startsWith(ticket)) ? `${ticket} ${baseSummary}` : baseSummary;
       const shortLabel = label.length > 40 ? label.slice(0, 37) + '...' : label;
       lines.push(`    ${shortId}  ${time}  ${shortLabel.padEnd(40)} $${info.cost.toFixed(4).padStart(9)}  ${pct.padStart(5)}%  ${fmtTokens(info.tokens).padStart(7)} tok`);
     }
